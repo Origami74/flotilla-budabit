@@ -20,6 +20,7 @@
     DiffViewer,
     IssueThread,
     MergeStatus,
+    Status,
     Tabs,
     TabsContent,
     TabsList,
@@ -28,13 +29,13 @@
     toast,
   } from "@nostr-git/ui"
   import ProfileLink from "@app/components/ProfileLink.svelte"
+  import NostrGitProfileComponent from "@app/components/NostrGitProfileComponent.svelte"
   import {profilesByPubkey, pubkey, repository} from "@welshman/app"
   import {deriveEventsAsc, deriveEventsById} from "@welshman/store"
   import {load, PublishStatus} from "@welshman/net"
   import {
     COMMENT,
     GIT_STATUS_CLOSED,
-    GIT_STATUS_COMPLETE,
     GIT_STATUS_DRAFT,
     GIT_STATUS_OPEN,
     type Filter,
@@ -49,6 +50,7 @@
     type CommentEvent,
     type StatusEvent,
     type PullRequestEvent,
+    GIT_PULL_REQUEST,
     GIT_PULL_REQUEST_UPDATE,
     GIT_STATUS_APPLIED,
   } from "@nostr-git/core/events"
@@ -119,18 +121,42 @@
   const {pr, prEvent, repo: repoClass, repoRelays}: Props = $props()
 
   const effectiveMaintainers = $derived.by((): string[] => {
+    const owner = (repoClass as any)?.repoEvent?.pubkey as string | undefined
+    const maintainers = (((repoClass as any)?.maintainers as string[]) || []).filter(
+      (value): value is string => Boolean(value),
+    )
+    const fallback = Array.from(
+      new Set([...maintainers, owner].filter((value): value is string => Boolean(value))),
+    )
     const repoAddress = (repoClass as any)?.address || ""
     if (!repoAddress) {
-      return Array.from(new Set((((repoClass as any)?.maintainers as string[]) || []).filter(Boolean)))
+      return fallback
     }
-    const maintainers = $effectiveMaintainersByRepoAddress.get(repoAddress)
-    if (maintainers && maintainers.size > 0) return Array.from(maintainers)
-    return Array.from(new Set((((repoClass as any)?.maintainers as string[]) || []).filter(Boolean)))
+    const mappedMaintainers = $effectiveMaintainersByRepoAddress.get(repoAddress)
+    if (mappedMaintainers && mappedMaintainers.size > 0) return Array.from(mappedMaintainers)
+    return fallback
   })
+
+  const effectiveMaintainerSet = $derived.by(() => new Set(effectiveMaintainers))
+
+  const canManagePr = $derived.by(() => {
+    if (!$pubkey) return false
+    return effectiveMaintainerSet.has($pubkey)
+  })
+
+  const statusRepo = $derived.by(
+    () =>
+      ({
+        maintainers: effectiveMaintainers,
+        relays: repoClass.relays || repoRelays || [],
+        repoEvent: (repoClass as any).repoEvent,
+        getCommitHistory: (...args: any[]) => (repoClass as any).getCommitHistory(...args),
+      }) as Repo,
+  )
 
   // PR-specific status and comments
   const getPrStatusFilter = () => ({
-    kinds: [GIT_STATUS_OPEN, GIT_STATUS_COMPLETE, GIT_STATUS_CLOSED, GIT_STATUS_DRAFT],
+    kinds: [GIT_STATUS_OPEN, GIT_STATUS_APPLIED, GIT_STATUS_CLOSED, GIT_STATUS_DRAFT],
     "#e": [prEvent?.id ?? ""],
   })
 
@@ -139,9 +165,21 @@
     return deriveEventsAsc(deriveEventsById({repository, filters: [getPrStatusFilter()]}))
   })
 
+  const prStatusEventsArray = $derived.by(() => {
+    if (!prStatusEvents) return []
+    return $prStatusEvents as StatusEvent[]
+  })
+
+  const prAuthorizedStatusEvents = $derived.by(() => {
+    if (!prEvent) return []
+    return prStatusEventsArray.filter(
+      (event) => event.pubkey === prEvent.pubkey || effectiveMaintainerSet.has(event.pubkey),
+    )
+  })
+
   const prStatus = $derived.by(() => {
-    if (!prEvent || !prStatusEvents) return undefined
-    const events = $prStatusEvents as any[]
+    if (!prEvent) return undefined
+    const events = prAuthorizedStatusEvents
     if (!events || events.length === 0) return undefined
     const latest = [...events].sort((a, b) => b.created_at - a.created_at)[0]
     return latest ? parseStatusEvent(latest as StatusEvent) : undefined
@@ -402,25 +440,65 @@
   const formatMergeAnalysisError = (message: string) => {
     const raw = (message || "Unknown merge analysis error").trim()
     const lower = raw.toLowerCase()
+    const withDetails = (friendly: string) => (friendly === raw ? friendly : `${friendly} Details: ${raw}`)
+
+    if (!raw || raw === "error" || raw === "unknown" || raw === "unknown error") {
+      return "Merge analysis failed without a usable error message. Retry sync + analyze."
+    }
     if (/timed out|timeout/.test(lower)) {
-      return "Merge analysis timed out while fetching remote data. Retry Analyze. If it keeps timing out, reload this page and try again."
+      return withDetails(
+        "Merge analysis timed out while fetching remote data. Retry sync + analyze. If it keeps timing out, reload this page and try again.",
+      )
     }
     if (lower.includes("no valid clone urls")) {
-      return "PR source has no valid clone URL configured. Add a valid clone URL and re-run analysis."
+      return withDetails(
+        "PR source has no valid clone URL configured. Add a valid clone URL and re-run analysis.",
+      )
     }
     if (lower.includes("target branch") && lower.includes("not found")) {
-      return `Target branch ${prTargetBranch} was not found on fetched remotes. Sync and verify branch name.`
+      return withDetails(
+        `Target branch ${prTargetBranch} was not found on fetched remotes. Sync and verify branch name.`,
+      )
     }
     if (lower.includes("source branch") && lower.includes("not found")) {
-      return "Source branch for this PR was not found on remote. Ensure the source branch is pushed."
+      return withDetails(
+        "Source branch for this PR was not found on remote. Ensure the source branch is pushed.",
+      )
     }
     if (/401|403|unauthorized|forbidden|auth|permission/.test(lower)) {
-      return "Authentication/permission failure while fetching PR refs. Check remote access and tokens."
+      return withDetails(
+        "Authentication/permission failure while fetching PR refs. Check remote access and tokens.",
+      )
     }
     if (/failed to fetch|network|cors|timeout|econn|enotfound/.test(lower)) {
-      return "Network/CORS error while fetching PR refs. Check connectivity or CORS policy and retry."
+      return withDetails(
+        "Network/CORS error while fetching PR refs. Check connectivity or CORS policy and retry.",
+      )
     }
     return raw
+  }
+
+  const formatSyncError = (message: string) => {
+    const raw = (message || "Target sync failed").trim()
+    const lower = raw.toLowerCase()
+    const withDetails = (friendly: string) => (friendly === raw ? friendly : `${friendly} Details: ${raw}`)
+
+    if (/missing tracking ref|cannot prove remote sync|remote fetch completed but no remote commit/.test(lower)) {
+      return withDetails(
+        `Target branch ${prTargetBranch} could not be verified against remote refs. Retry sync and check remote credentials/access.`,
+      )
+    }
+    if (/cors|network|failed to fetch|timeout|econn|enotfound/.test(lower)) {
+      return withDetails(
+        "Target sync failed due to network/CORS issues. Retry sync + analyze after network or CORS recovery.",
+      )
+    }
+    if (/401|403|unauthorized|forbidden|auth|permission/.test(lower)) {
+      return withDetails(
+        "Target sync failed due to authentication/permission issues. Check tokens/credentials and retry.",
+      )
+    }
+    return withDetails(`Target sync failed for branch ${prTargetBranch}.`)
   }
 
   const toAnalysisErrorResult = (errorMessage: string, patchCommits: string[]): PRMergeAnalysisResult => ({
@@ -531,10 +609,12 @@
 
       let syncResult: any
       try {
-        syncResult = await repoClass.workerManager.syncWithRemote({
+        syncResult = await (repoClass.workerManager as any).syncWithRemote({
           repoId: repoClass.key,
           cloneUrls: targetCloneUrls,
           branch: prTargetBranch,
+          requireRemoteSync: true,
+          requireTrackingRef: true,
         })
       } catch (error) {
         const syncError = getErrorText(error)
@@ -547,10 +627,12 @@
 
         setPrPhaseProgress(phase, "Repository clone complete, syncing target branch...")
         try {
-          syncResult = await repoClass.workerManager.syncWithRemote({
+          syncResult = await (repoClass.workerManager as any).syncWithRemote({
             repoId: repoClass.key,
             cloneUrls: targetCloneUrls,
             branch: prTargetBranch,
+            requireRemoteSync: true,
+            requireTrackingRef: true,
           })
         } catch (retryError) {
           return {
@@ -578,10 +660,12 @@
       if (syncResult.needsUpdate === true) {
         try {
           await repoClass.workerManager.resetRepoToRemote(repoClass.key, prTargetBranch)
-          effectiveSync = await repoClass.workerManager.syncWithRemote({
+          effectiveSync = await (repoClass.workerManager as any).syncWithRemote({
             repoId: repoClass.key,
             cloneUrls: targetCloneUrls,
             branch: prTargetBranch,
+            requireRemoteSync: true,
+            requireTrackingRef: true,
           })
         } catch (error) {
           return {
@@ -607,6 +691,16 @@
         return {
           ok: false,
           error: `Target branch ${prTargetBranch} is still behind remote after sync`,
+        }
+      }
+
+      if (effectiveSync?.synced !== true) {
+        return {
+          ok: false,
+          error:
+            effectiveSync?.error ||
+            effectiveSync?.warning ||
+            `Target branch ${prTargetBranch} could not be synced with remote refs`,
         }
       }
 
@@ -644,8 +738,9 @@
       const sync = await syncTargetBranchForPR("analysis")
       if (prAnalysisGeneration !== myGen) return
       if (!sync.ok) {
+        const syncError = formatSyncError(sync.error || `Failed to sync target branch ${prTargetBranch}`)
         prMergeAnalysisResult = toAnalysisErrorResult(
-          `Cannot run merge analysis until target branch is synced: ${sync.error}`,
+          `Cannot run merge analysis until target branch is synced: ${syncError}`,
           [tipOid],
         )
         return
@@ -655,7 +750,23 @@
       prAnalysisProgress = "Fetching PR from clone URL..."
       const result = await repoClass.getPRMergeAnalysis(cloneUrls, tipOid, prTargetBranch)
       if (prAnalysisGeneration === myGen) {
-        prMergeAnalysisResult = result ?? toAnalysisErrorResult("Analysis returned no result", [tipOid])
+        if (!result) {
+          prMergeAnalysisResult = toAnalysisErrorResult(
+            "Merge analysis returned no result. Retry sync + analyze.",
+            [tipOid],
+          )
+          return
+        }
+
+        if (result.analysis === "error") {
+          prMergeAnalysisResult = {
+            ...result,
+            errorMessage: formatMergeAnalysisError(result.errorMessage || "Merge analysis failed"),
+          }
+          return
+        }
+
+        prMergeAnalysisResult = result
       }
     } catch (err) {
       if (prAnalysisGeneration === myGen) {
@@ -971,14 +1082,23 @@
       })
       .then((result: typeof updatePrPreview) => {
         if (cancelled) return
-        updatePrPreview = result
+        if (result && !result.success && result.error) {
+          updatePrPreview = {
+            ...result,
+            error: formatMergeAnalysisError(result.error),
+          }
+        } else {
+          updatePrPreview = result
+        }
         updatePrPreviewLoading = false
       })
       .catch((err: unknown) => {
         if (cancelled) return
         updatePrPreview = {
           success: false,
-          error: err instanceof Error ? err.message : String(err),
+          error: formatMergeAnalysisError(
+            err instanceof Error ? err.message : String(err || "Failed to load PR update preview"),
+          ),
           commits: [],
           commitOids: [],
           tipCommit: undefined,
@@ -1010,14 +1130,21 @@
       })
       .then((result) => {
         if (cancelled) return
-        updatePrPreview = result
+        if (result && !result.success && result.error) {
+          updatePrPreview = {
+            ...result,
+            error: formatMergeAnalysisError(result.error),
+          }
+        } else {
+          updatePrPreview = result
+        }
         updatePrPreviewLoading = false
       })
       .catch((err) => {
         if (cancelled) return
         updatePrPreview = {
           success: false,
-          error: err?.message,
+          error: formatMergeAnalysisError(err?.message || "Failed to load PR update preview"),
           commits: [],
           commitOids: [],
           tipCommit: undefined,
@@ -1112,6 +1239,28 @@
   const onCommentCreated = async (comment: CommentEvent) => {
     const relays = (repoRelays || []).map((u: string) => normalizeRelayUrl(u)).filter(Boolean)
     postComment(comment, relays)
+  }
+
+  const handlePrStatusPublish = async (statusEvent: StatusEvent) => {
+    if (!prEvent || !$pubkey) return
+    if ($pubkey !== prEvent.pubkey && !canManagePr) {
+      throw new Error("Only the PR author or maintainers can change PR status")
+    }
+
+    const recipients = Array.from(
+      new Set([...effectiveMaintainers, prEvent.pubkey, $pubkey].filter(Boolean)),
+    )
+    const tags = (statusEvent.tags || []).filter((tag: string[]) => tag[0] !== "p")
+    tags.push(...recipients.map((recipient: string) => ["p", recipient] as ["p", string]))
+
+    const statusWithRecipients = {
+      ...statusEvent,
+      tags,
+    }
+    const relays = (repoClass.relays || repoRelays || [])
+      .map((u: string) => normalizeRelayUrl(u))
+      .filter(Boolean)
+    return postStatus(statusWithRecipients as any, relays)
   }
 
   // PR merge state
@@ -1285,6 +1434,7 @@
   }
 
   const applyPR = () => {
+    if (!canManagePr) return
     if (!pr || !prEvent || !prEffectiveTipOid) return
     isMergingPr = false
     mergePrStep = ""
@@ -1374,6 +1524,7 @@
   }
 
   const executePRMerge = async () => {
+    if (!canManagePr) return
     if (
       !pr ||
       !prEvent ||
@@ -1403,7 +1554,7 @@
 
     const sync = await syncTargetBranchForPR("merge")
     if (!sync.ok) {
-      mergePrError = `Cannot merge until target branch is synced: ${sync.error}`
+      mergePrError = `Cannot merge until target branch is synced: ${formatSyncError(sync.error || "Sync failed")}`
       mergePrStep = "Sync failed"
       isMergingPr = false
       toast.push({message: mergePrError, timeout: 7000, variant: "destructive"})
@@ -1452,11 +1603,14 @@
       const commitIds = prCommitOids
       const appliedCommits =
         commitIds.length > 0 ? commitIds : prEffectiveTipOid ? [prEffectiveTipOid] : undefined
+      const recipients = Array.from(
+        new Set([...effectiveMaintainers, prEvent.pubkey, $pubkey].filter(Boolean)),
+      )
       const statusEvent = createStatusEvent({
         kind: GIT_STATUS_APPLIED,
         content: mergePrCommitMessage || `PR applied: ${pr?.subject || "Untitled"}`,
         rootId: prEvent.id,
-        recipients: effectiveMaintainers,
+        recipients,
         repoAddr: (repoClass as any).repoId || (repoClass as any).address || "",
         relays: repoClass.relays || repoRelays || [],
         appliedCommits,
@@ -1479,6 +1633,7 @@
   }
 
   const markPrAsApplied = async () => {
+    if (!canManagePr) return
     if (!prEvent || !$pubkey) return
     isMarkingApplied = true
     markAsAppliedSuccess = false
@@ -1626,6 +1781,18 @@
         </div>
       {/if}
 
+      <div class="mb-6">
+        <Status
+          repo={statusRepo}
+          rootId={prEvent.id}
+          rootKind={GIT_PULL_REQUEST}
+          rootAuthor={prEvent.pubkey}
+          statusEvents={prStatusEventsArray}
+          actorPubkey={$pubkey}
+          ProfileComponent={NostrGitProfileComponent}
+          onPublish={handlePrStatusPublish} />
+      </div>
+
       <!-- PR merge analysis -->
       <div class="mb-6 rounded-lg border bg-muted/20 p-4">
         <div class="mb-3 flex items-center justify-between">
@@ -1668,6 +1835,16 @@
                   Resolution: click Analyze to retry. If retries keep timing out, reload the page and try again.
                 </p>
               {/if}
+              <div class="mt-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={() => runPRMergeAnalysis()}
+                  disabled={isAnalyzingPRMerge}
+                  class="h-7">
+                  Retry sync + analyze
+                </Button>
+              </div>
             </div>
           {/if}
           {#if prMergeAnalysisResult.usedCloneUrl}
@@ -1720,7 +1897,7 @@
       </div>
 
       <!-- PR Merge section (maintainers only, when canMerge and open) -->
-      {#if repoClass.maintainers?.includes($pubkey!) &&
+      {#if canManagePr &&
         prMergeAnalysisResult?.canMerge === true &&
         prStatus?.status === "open" &&
         !prMergeAnalysisResult?.upToDate}
@@ -1843,7 +2020,7 @@
       {/if}
 
       <!-- Mark as applied (maintainers only, when up-to-date and open - no git ops) -->
-      {#if repoClass.maintainers?.includes($pubkey!) &&
+      {#if canManagePr &&
         prStatus?.status === "open" &&
         prMergeAnalysisResult &&
         prMergeAnalysisResult.upToDate === true}
@@ -2044,19 +2221,25 @@
 
       <div class="mb-6 scroll-mt-4 rounded-lg border bg-muted/20 p-4" id="pr-changes">
         <Tabs bind:value={prReviewTab} class="w-full">
-          <div class="mb-3 flex items-center justify-between gap-3">
-            <TabsList class="grid w-full max-w-sm grid-cols-2">
-              <TabsTrigger value="commits">Commits ({prCommitOids.length})</TabsTrigger>
-              <TabsTrigger value="files">Files changed ({prChanges?.length ?? 0})</TabsTrigger>
+          <div class="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <TabsList class="grid w-full grid-cols-2 sm:max-w-sm">
+              <TabsTrigger value="commits" class="px-2 text-xs sm:text-sm">
+                <span class="sm:hidden">Commits</span>
+                <span class="hidden sm:inline">Commits ({prCommitOids.length})</span>
+              </TabsTrigger>
+              <TabsTrigger value="files" class="px-2 text-xs sm:text-sm">
+                <span class="sm:hidden">Files</span>
+                <span class="hidden sm:inline">Files changed ({prChanges?.length ?? 0})</span>
+              </TabsTrigger>
             </TabsList>
 
             {#if prReviewTab === "commits" && prCommitOids.length > 0}
-              <div class="flex gap-2">
+              <div class="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
                 <button
                   type="button"
                   onclick={() => expandAllPrCommits()}
                   disabled={prExpandedCommits.size === prCommitOids.length}
-                  class="rounded border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50">
+                  class="w-full rounded border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50 sm:w-auto">
                   Expand all
                 </button>
                 <button
@@ -2065,19 +2248,19 @@
                     prExpandedCommits = new Set()
                   }}
                   disabled={prExpandedCommits.size === 0}
-                  class="rounded border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50">
+                  class="w-full rounded border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50 sm:w-auto">
                   Collapse all
                 </button>
               </div>
             {:else if prReviewTab === "files" && prChanges && prChanges.length > 0}
-              <div class="flex gap-2">
+              <div class="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
                 <button
                   type="button"
                   onclick={() => {
                     prExpandedFiles = new Set(prChanges!.map((c) => c.path))
                   }}
                   disabled={prExpandedFiles.size === prChanges!.length}
-                  class="rounded border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50">
+                  class="w-full rounded border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50 sm:w-auto">
                   Expand all
                 </button>
                 <button
@@ -2086,7 +2269,7 @@
                     prExpandedFiles = new Set()
                   }}
                   disabled={prExpandedFiles.size === 0}
-                  class="rounded border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50">
+                  class="w-full rounded border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50 sm:w-auto">
                   Collapse all
                 </button>
               </div>

@@ -22,6 +22,12 @@ type GitWorkerConfig = {
   defaultCorsProxy?: string | null
 }
 
+const WORKER_SINGLETON_BUILD_ID = new Date().toISOString()
+
+if (import.meta.env.DEV) {
+  console.info(`[GitWorker] singleton module loaded: ${WORKER_SINGLETON_BUILD_ID}`)
+}
+
 const FALLBACK_GIT_CORS_PROXY = "https://corsproxy.budabit.club"
 const GIT_CORS_PROXY_STORAGE_KEY = "budabit/git/corsProxy"
 
@@ -41,7 +47,17 @@ const resolveStoredCorsProxy = (): string => {
   if (typeof localStorage === "undefined") return DEFAULT_GIT_CORS_PROXY
   const raw = localStorage.getItem(GIT_CORS_PROXY_STORAGE_KEY) ?? ""
   const normalized = normalizeCorsProxy(raw)
-  return normalized || DEFAULT_GIT_CORS_PROXY
+  const effective = normalized || DEFAULT_GIT_CORS_PROXY
+
+  if (!normalized) {
+    try {
+      localStorage.setItem(GIT_CORS_PROXY_STORAGE_KEY, effective)
+    } catch {
+      // ignore storage write failures
+    }
+  }
+
+  return effective
 }
 
 let workerInstance: GitWorkerInstance | null = null
@@ -166,4 +182,10 @@ export function terminateGitWorker(): void {
  */
 export function isGitWorkerInitialized(): boolean {
   return workerInstance !== null
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    terminateGitWorker()
+  })
 }

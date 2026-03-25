@@ -24,6 +24,7 @@
   import {decodeRelay} from "@app/core/state"
   import {profilesByPubkey, profileSearch, loadProfile} from "@welshman/app"
   import ProfileLink from "@app/components/ProfileLink.svelte"
+  import NostrGitProfileComponent from "@app/components/NostrGitProfileComponent.svelte"
   import {slide} from "svelte/transition"
   import {getContext, onMount} from "svelte"
   import {postComment, postStatus, postLabel, postRoleLabel} from "@lib/budabit"
@@ -411,12 +412,12 @@
             <Status
               repo={repoClass}
               rootId={issue.id}
-              rootKind={1621}
+              rootKind={GIT_ISSUE}
               rootAuthor={issue.author.pubkey}
               statusEvents={($statusEvents || []) as StatusEvent[]}
               actorPubkey={$pubkey}
               compact={true}
-              ProfileComponent={ProfileLink} />
+              ProfileComponent={NostrGitProfileComponent} />
             <span
               class="flex flex-wrap items-center gap-1 text-xs text-muted-foreground sm:text-sm">
               <ProfileLink pubkey={issue?.author.pubkey}></ProfileLink>
@@ -526,12 +527,12 @@
         <Status
           repo={repoClass}
           rootId={issue.id}
-          rootKind={1621}
+          rootKind={GIT_ISSUE}
           rootAuthor={issue.author.pubkey}
           statusEvents={($statusEvents || []) as StatusEvent[]}
           actorPubkey={$pubkey}
           compact={false}
-          ProfileComponent={ProfileLink}
+          ProfileComponent={NostrGitProfileComponent}
           onPublish={handleStatusPublish} />
       </div>
 
